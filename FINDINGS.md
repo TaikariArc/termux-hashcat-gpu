@@ -47,3 +47,46 @@ hashcat 的 HMAC/PBKDF2 类内核（含嵌套 struct 如 sha1_hmac_ctx_t）编�
 - clspv 处理 struct padding 的 offset 计算
 - SROA 与 clspv 自定义 pass 的交互
 - 嵌套 struct 的 GEP 索引保留
+
+
+---
+
+## 第 4 层 bug 深入进展 (2026-10-07 下午)
+
+### 新增证据
+
+用 CLSPV_DBG_EOG_OUT 环境变量在 ExtractOffsetFromGEP 出口加打印，确认：
+
+- getelementptr [5 x <4 x i32>], ptr %5, i32 0, i32 2   返回 CstVal=2 SBW=128  (正确)
+- getelementptr <4 x i32>, ptr %0, i32 24              返回 CstVal=24 SBW=128 (正确)
+- 所有输入侧的 offset 值都正确
+
+### 结论
+
+- bug 不在 ExtractOffsetFromGEP (它的输出正确)
+- bug 在 GoThroughTypeAtOffset 的聚合类型递归：
+  - 对 [5 x <4 x i32>] 数组 + 嵌套 vector，索引重算错
+  - 尝试过 "vector 用自身 size、array 用元素 size" 的 split 修复，未成功
+
+### 已尝试但无效的补丁
+
+clspv/lib/BitcastUtils.cpp GoThroughTypeAtOffset else 分支改为：
+
+    auto idx_unit = Ty->isVectorTy()
+                        ? SizeInBits(DataLayout, Ty)      // 128 for <4 x i32>
+                        : SizeInBits(DataLayout, NextTy); // 32 for i32
+
+结果：-m 150 仍 Exhausted。
+
+### 建议接手方向
+
+1. 在 GoThroughTypeAtOffset 的 while 循环每次迭代打印 (Ty, Offset, Idxs.back())
+2. 找出 [5 x <4 x i32>] 场景下 IDX 什么时候从 2 变成 0
+3. 检查 Ty == TargetTy 的早退逻辑是否错误地对嵌套结构提前退出
+4. 参考 mini_vec.cl 的 producer IR (需重跑 clspv --show-producer-ir)
+
+### 环境备注
+
+- clspv commit: 见 README
+- 关键 patch: patches/clspv/all.patch + 本文档附的 GoThroughTypeAtOffset 修改
+- 复现: clspv --int8 -x=cl -O0 -o out.spv test/mini_vec.cl
