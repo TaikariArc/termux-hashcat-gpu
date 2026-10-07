@@ -1,0 +1,130 @@
+diff --git a/lib/BitcastUtils.cpp b/lib/BitcastUtils.cpp
+index ccf95a86..cc907e49 100644
+--- a/lib/BitcastUtils.cpp
++++ b/lib/BitcastUtils.cpp
+@@ -1296,7 +1296,8 @@ int64_t GoThroughTypeAtOffset(const DataLayout &DataLayout,
+          (TargetTy == nullptr ||
+           SizeInBits(DataLayout, Ty) > SizeInBits(DataLayout, TargetTy) ||
+           (Ty != TargetTy &&
+-           SizeInBits(DataLayout, Ty) == SizeInBits(DataLayout, TargetTy)))) {
++           SizeInBits(DataLayout, Ty) == SizeInBits(DataLayout, TargetTy)) ||
++          Offset != 0)) {
+     if (auto STy = dyn_cast<StructType>(Ty)) {
+       auto SLayout = DataLayout.getStructLayout(STy);
+       auto SId = SLayout->getElementContainingOffset(Offset / CHAR_BIT);
+diff --git a/lib/Compiler.cpp b/lib/Compiler.cpp
+index 28969bb0..ec0af20f 100644
+--- a/lib/Compiler.cpp
++++ b/lib/Compiler.cpp
+@@ -729,8 +729,9 @@ int RunPassPipeline(llvm::Module &M, llvm::raw_svector_ostream *binaryStream,
+ 
+     // SROA pass is run because it will fold structs/unions that are
+     // problematic on Vulkan SPIR-V away.
+-    pm.addPass(llvm::createModuleToFunctionPassAdaptor(
+-        llvm::SROAPass(llvm::SROAOptions::PreserveCFG)));
++    // SKIPPED-SROA: disabled again for r7 test
++    // pm.addPass(llvm::createModuleToFunctionPassAdaptor(
++    //     llvm::SROAPass(llvm::SROAOptions::PreserveCFG)));
+ 
+     // InstructionCombining pass folds bitcast and gep instructions which are
+     // not supported by Vulkan SPIR-V.
+@@ -901,11 +902,12 @@ int ParseOptions(const int argc, const char *const argv[]) {
+   }
+ 
+   int llvmArgc = 3;
+-  const char *llvmArgv[6];
++  const char *llvmArgv[12];
+   llvmArgv[0] = argv[0];
+   llvmArgv[1] = "-simplifycfg-sink-common=false";
+   // TODO(#738): find a better solution to this.
+   llvmArgv[2] = "-disable-vector-combine";
++  // REMOVED-TEST: // DISABLED llvmArgv[llvmArgc++] = "-switch-to-lookup=false";
+   if (!has_pre) {
+     llvmArgv[llvmArgc++] = "-enable-scalar-pre=0";
+   }
+@@ -915,6 +917,11 @@ int ParseOptions(const int argc, const char *const argv[]) {
+ 
+   llvm::cl::ResetAllOptionOccurrences();
+   llvm::cl::ParseCommandLineOptions(llvmArgc, llvmArgv);
++  llvm::errs() << "CLSPV_ARGS:";
++  for (int i = 0; i < argc; i++) {
++    llvm::errs() << " [" << argv[i] << "]";
++  }
++  llvm::errs() << "\n";
+   llvm::cl::ParseCommandLineOptions(argc, argv);
+ 
+   if (!clspv::Option::OpaquePointers()) {
+diff --git a/lib/ReplaceLLVMIntrinsicsPass.cpp b/lib/ReplaceLLVMIntrinsicsPass.cpp
+index 6d6bebe9..9c9a8d16 100644
+--- a/lib/ReplaceLLVMIntrinsicsPass.cpp
++++ b/lib/ReplaceLLVMIntrinsicsPass.cpp
+@@ -549,9 +549,31 @@ static bool replaceMemmoveDynamic(Module &M, MemMoveInst *MMI) {
+   // Use LLVM utility to expand memmove intrinsic as a loop of byte
+   // copies.
+   auto BB = MMI->getParent(); // Record original basic block
++  llvm::errs() << "[RLLI] dynamic: calling expandMemMoveAsLoop\n";
+   if (!expandMemMoveAsLoop(MMI, TargetTransformInfo(M.getDataLayout()))) {
+-    return false;
++    llvm::errs() << "[RLLI] expandMemMoveAsLoop returned FALSE\n";
++    // FALLBACK: cross-address-space memmove that expandMemMoveAsLoop
++    // cannot handle. Use generic memcpy-as-loop expansion which
++    // loads/stores directly in each pointer own address space.
++    if (auto *LenCI = dyn_cast<ConstantInt>(MMI->getLength())) {
++      llvm::createMemCpyLoopKnownSize(
++          MMI, MMI->getRawSource(), MMI->getRawDest(), LenCI,
++          MMI->getSourceAlign().valueOrOne(),
++          MMI->getDestAlign().valueOrOne(), MMI->isVolatile(),
++          MMI->isVolatile(), /*CanOverlap=*/true,
++          TargetTransformInfo(M.getDataLayout()));
++    } else {
++      llvm::createMemCpyLoopUnknownSize(
++          MMI, MMI->getRawSource(), MMI->getRawDest(), MMI->getLength(),
++          MMI->getSourceAlign().valueOrOne(),
++          MMI->getDestAlign().valueOrOne(), MMI->isVolatile(),
++          MMI->isVolatile(), /*CanOverlap=*/true,
++          TargetTransformInfo(M.getDataLayout()));
++    }
++    MMI->eraseFromParent();
++    return true;
+   }
++  llvm::errs() << "[RLLI] expandMemMoveAsLoop OK\n";
+ 
+   // expandMemMoveAsLoop creates a 'icmp ptr' instruction that we try to
+   // transform to avoid lowering to OpPtrDiff which isn't supported for
+@@ -669,6 +691,7 @@ static bool replaceMemmoveStatic(Module &M, MemMoveInst *MMI) {
+   auto *Length = cast<ConstantInt>(MMI->getLength());
+   auto NumBytes = Length->getZExtValue();
+ 
++  llvm::errs() << "[RLLI] static: NumBytes=" << NumBytes << " limit=" << clspv::Option::MemmoveAllocaLimit() << "\n";
+   if (NumBytes > clspv::Option::MemmoveAllocaLimit()) {
+     // If limit on maximum size of alloca exceeded, then fall back to
+     // dynamic implementation
+@@ -702,22 +725,28 @@ bool clspv::ReplaceLLVMIntrinsicsPass::replaceMemmove(Module &M) {
+   bool Changed = false;
+   for (auto &F : M) {
+     if (F.getName().contains("llvm.memmove")) {
++      llvm::errs() << "[RLLI] found memmove fn: " << F.getName() << " uses=" << F.getNumUses() << "\n";
+       SmallVector<MemMoveInst *, 8> CallsToReplace;
+ 
+       for (auto U : F.users()) {
+         if (auto MMI = dyn_cast<MemMoveInst>(U)) {
+           CallsToReplace.push_back(MMI);
++        } else {
++          llvm::errs() << "[RLLI] user is not MemMoveInst\n";
+         }
+       }
++      llvm::errs() << "[RLLI] CallsToReplace=" << CallsToReplace.size() << " int8=" << clspv::Option::Int8Support() << "\n";
+ 
+       if (!CallsToReplace.empty() && !clspv::Option::Int8Support()) {
+         llvm_unreachable("Lowering memmove intrinsic requires Int8 Capability");
+       }
+ 
+       for (auto MMI : CallsToReplace) {
++        llvm::errs() << "[RLLI] process MMI isConst=" << isa<ConstantInt>(MMI->getLength()) << "\n";
+         bool DidTransform = isa<ConstantInt>(MMI->getLength())
+                                 ? replaceMemmoveStatic(M, MMI)
+                                 : replaceMemmoveDynamic(M, MMI);
++        llvm::errs() << "[RLLI] DidTransform=" << DidTransform << "\n";
+         if (DidTransform) {
+           Changed = true;
+         }

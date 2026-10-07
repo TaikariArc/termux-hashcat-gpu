@@ -1,0 +1,67 @@
+diff --git a/src/api.cpp b/src/api.cpp
+index 39b99b5..e9d6e12 100644
+--- a/src/api.cpp
++++ b/src/api.cpp
+@@ -2982,16 +2982,11 @@ cl_int CLVK_API_CALL clSetKernelArg(cl_kernel kern, cl_uint arg_index,
+     // kernel argument so allow nullptr for its value. It will not have an
+     // affect on the kernel's operation.
+     auto arg_kind = kernel->arg_kind(arg_index);
+-    if ((arg_value == nullptr) &&
+-        !((arg_kind == kernel_argument_kind::local) ||
+-          (arg_kind == kernel_argument_kind::unused))) {
+-        cvk_error_fn("passing a null pointer to clSetKernelArg is only "
+-                     "supported for local arguments");
+-        if (arg_kind == kernel_argument_kind::sampler) {
+-            return CL_INVALID_SAMPLER;
+-        } else {
+-            return CL_INVALID_ARG_VALUE;
+-        }
++    // hashcat passes nullptr for void* placeholder args that clspv does not
++    // mark as unused when -int8 is enabled. Just skip them.
++    if (arg_value == nullptr &&
++        arg_kind != kernel_argument_kind::local) {
++        return CL_SUCCESS;
+     }
+ 
+     if (arg_size == 0 &&
+diff --git a/src/device.cpp b/src/device.cpp
+index b39ba54..067b963 100644
+--- a/src/device.cpp
++++ b/src/device.cpp
+@@ -490,9 +490,9 @@ void cvk_device::init_compiler_options() {
+         m_device_compiler_options += " -fp64=0 ";
+     }
+     if (supports_int8()) {
+-        m_device_compiler_options += " -rewrite-packed-structs ";
++        m_device_compiler_options += " -int8 -O0 ";
+     } else {
+-        m_device_compiler_options += " -int8=0 ";
++        // int8 default=true, do not disable
+     }
+     if (supports_ubo_stdlayout()) {
+         m_device_compiler_options += " -std430-ubo-layout ";
+@@ -502,7 +502,7 @@ void cvk_device::init_compiler_options() {
+     }
+ 
+     // Device specific options
+-    m_device_compiler_options += " " + m_clvk_properties->clspv_options() +
++    m_device_compiler_options += " -O1 " + m_clvk_properties->clspv_options() +
+                                  " -arch=" + config.spirv_arch() + " ";
+ 
+     if (config.physical_addressing()) {
+diff --git a/src/kernel.hpp b/src/kernel.hpp
+index 5bc32b2..d90c95b 100644
+--- a/src/kernel.hpp
++++ b/src/kernel.hpp
+@@ -357,7 +357,10 @@ struct cvk_kernel_argument_values {
+             } else {
+                 auto apimem = *reinterpret_cast<const cl_mem*>(value);
+                 if (apimem == nullptr) {
+-                    return CL_INVALID_MEM_OBJECT;
++                    // OpenCL permits NULL buffers for unused/optional args.
++                    m_kernel_resources[arg.pos] = nullptr;
++                    m_args_set[arg.pos] = true;
++                    return CL_SUCCESS;
+                 }
+                 auto mem = icd_downcast(apimem);
+                 if (!mem->is_valid() ||

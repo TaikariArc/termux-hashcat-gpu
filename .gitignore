@@ -1,0 +1,7 @@
+*.log
+*.spv
+*.bc
+*.ll
+build/
+obj/
+*.tar.gz
